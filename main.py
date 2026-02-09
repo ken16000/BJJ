@@ -4,221 +4,288 @@ import time
 import os
 import subprocess
 import yt_dlp
+import shutil
+import tempfile
+import re
+
+# --- Constants ---
+MAX_POLL_SECONDS = 120
+MAX_CHAT_HISTORY = 50
+CHAT_CONTEXT_WINDOW = 5
+COMPRESS_HEIGHT = 480
+COMPRESS_VIDEO_BITRATE = "800k"
+COMPRESS_AUDIO_BITRATE = "64k"
 
 # --- 1. App Config ---
-st.set_page_config(page_title="BJJ Expert AI v2", layout="wide", page_icon="🥋")
+st.set_page_config(page_title="BJJ Expert AI v6.7", layout="wide", page_icon="🥋")
 
-if 'video_path' not in st.session_state:
-    st.session_state.video_path = None
+if 'video_path' not in st.session_state: st.session_state.video_path = None
+if 'chat_history' not in st.session_state: st.session_state.chat_history = []
+if 'uploaded_video_obj' not in st.session_state: st.session_state.uploaded_video_obj = None
+if 'analysis_done' not in st.session_state: st.session_state.analysis_done = False
+if 'user_identity' not in st.session_state: st.session_state.user_identity = ""
+if 'temp_files' not in st.session_state: st.session_state.temp_files = []
+if 'uploaded_file_name' not in st.session_state: st.session_state.uploaded_file_name = None
+if 'gemini_file_name' not in st.session_state: st.session_state.gemini_file_name = None
 
-st.title("🥋 BJJ Advanced Technical Analysis (Gemini 2.5 Pro)")
+# --- CSS: ホワイトUI & ダーク入力エリア（白文字） ---
+# NOTE: These CSS selectors target Streamlit internal elements and may break on version upgrades.
+st.markdown("""
+    <style>
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"], [data-testid="stSidebar"] {
+        background-color: #ffffff !important;
+    }
 
-# --- 2. Sidebar (Personalization) ---
-with st.sidebar:
-    st.header("⚙️ Settings & Profile")
-    api_key = st.text_input("Gemini API Key", type="password")
-    
-    st.divider()
-    st.subheader("👤 Your Style")
-    # Hints for AI
-    belt_level = st.selectbox("Current Belt Level", ["White", "Blue", "Purple", "Brown", "Black"])
-    favorite_moves = st.text_input("Favorite Guards/Moves", placeholder="e.g. De La Riva, Spider Guard, Triangle Choke")
-    specific_concern = st.text_area("Specific Concerns / Focus Area", placeholder="e.g. framing against pass guard, timing for shrimp")
-    
-    st.divider()
-    if st.button("Clear Cache (Video Data)"):
-        st.session_state.video_path = None
-        st.rerun()
+    /* テキスト全般 */
+    .stMarkdown p, .stMarkdown li, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3,
+    label, [data-testid="stWidgetLabel"] p {
+        color: #1a1a1a !important;
+        font-family: 'Inter', sans-serif;
+    }
 
-# --- 3. Video Compression & Captioning Functions ---
+    /* Identity入力欄: 背景を濃いグレー、文字を白、枠線を太くして視認性を最大化 */
+    .stTextInput input {
+        background-color: #262730 !important;
+        color: #ffffff !important;
+        border: 2px solid #1a1a1a !important;
+        border-radius: 8px !important;
+        font-size: 16px !important;
+        padding: 10px !important;
+    }
+
+    /* 右チャットパネル */
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid #f0f0f0 !important;
+        background-color: #ffffff !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+# --- Helper Functions ---
+def sanitize_user_input(text, max_len=100):
+    """Strip to alphanumeric + basic punctuation, enforce max length."""
+    cleaned = re.sub(r'[^\w\s.,!?\'-]', '', text, flags=re.UNICODE)
+    return cleaned[:max_len].strip()
+
+
+def cleanup_temp_files():
+    """Delete temp files tracked in session state."""
+    for path in st.session_state.get('temp_files', []):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def cleanup_gemini_file(client):
+    """Delete the uploaded file from Gemini servers."""
+    name = st.session_state.get('gemini_file_name')
+    if name:
+        try:
+            client.files.delete(name=name)
+        except Exception:
+            pass
+
+
 def compress_video(input_path, output_path):
-    # Consider Anaconda environment path
-    possible_ffmpeg_paths = ["/Users/kenichirokenichirououchioouchi/opt/anaconda3/bin/ffmpeg", "ffmpeg"]
-    ffmpeg_path = next((p for p in possible_ffmpeg_paths if os.path.exists(p) or p == "ffmpeg"), "ffmpeg")
-
+    ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
     try:
         cmd = [
             ffmpeg_path, '-y', '-i', input_path,
-            '-vf', 'scale=-2:480',
-            '-b:v', '800k',
-            '-c:a', 'aac', '-b:a', '64k',
+            '-vf', f'scale=-2:{COMPRESS_HEIGHT}',
+            '-b:v', COMPRESS_VIDEO_BITRATE,
+            '-c:a', 'aac', '-b:a', COMPRESS_AUDIO_BITRATE,
             output_path
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return output_path
-    except Exception as e:
-        st.warning(f"ffmpeg compression failed. Sending original video size.")
+    except subprocess.CalledProcessError:
+        st.warning("Video compression failed — using original file.")
+        return input_path
+    except FileNotFoundError:
+        st.warning("ffmpeg not found — using original file.")
         return input_path
 
-def parse_timestamp(ts_str):
-    """Converts MM:SS to total seconds."""
-    try:
-        parts = ts_str.split(':')
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + int(parts[1])
-        elif len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    except ValueError:
-        return 0
-    return 0
 
-def generate_srt(captions, srt_path):
-    """Generates an SRT file from the captions list."""
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        for i, cap in enumerate(captions):
-            start_seconds = parse_timestamp(cap['timestamp'])
-            end_seconds = start_seconds + 4  # Show caption for 4 seconds
-            
-            # Format: 00:00:00,000
-            start_ts = f"{start_seconds // 3600:02}:{(start_seconds % 3600) // 60:02}:{start_seconds % 60:02},000"
-            end_ts = f"{end_seconds // 3600:02}:{(end_seconds % 3600) // 60:02}:{end_seconds % 60:02},000"
-            
-            f.write(f"{i+1}\n")
-            f.write(f"{start_ts} --> {end_ts}\n")
-            f.write(f"{cap['text']}\n\n")
-
-def burn_subtitles(video_path, srt_path, output_path):
-    """Burns subtitles into the video using ffmpeg."""
-    # Consider Anaconda environment path
-    possible_ffmpeg_paths = ["/Users/kenichirokenichirououchioouchi/opt/anaconda3/bin/ffmpeg", "ffmpeg"]
-    ffmpeg_path = next((p for p in possible_ffmpeg_paths if os.path.exists(p) or p == "ffmpeg"), "ffmpeg")
-    
+def download_video_from_url(url):
+    """Download a video from URL via yt_dlp to a temp file."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': tmp.name,
+        'quiet': True,
+        'overwrites': True,
+    }
     try:
-        # Note: 'subtitles' filter requires the full path to the SRT file
-        abs_srt_path = os.path.abspath(srt_path).replace('\\', '/')
-        # Escape colon in path for ffmpeg filter (Windows mainly, but safe practice)
-        abs_srt_path = abs_srt_path.replace(':', '\\:')
-        
-        cmd = [
-            ffmpeg_path, '-y', '-i', video_path,
-            '-vf', f"subtitles='{abs_srt_path}':force_style='FontSize=24,PrimaryColour=&H00FFFF,BackColour=&H80000000,BorderStyle=3'",
-            '-c:a', 'copy',
-            output_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return output_path
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return tmp.name
     except Exception as e:
-        print(f"Error burning subtitles: {e}")
+        st.error(f"Download failed: {e}")
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
         return None
 
-# --- 4. Main Logic ---
+
+# --- 2. Sidebar ---
+with st.sidebar:
+    st.markdown("### Settings")
+    api_key = st.text_input("Gemini API Key", type="password")
+    language = st.selectbox("Language", ["Japanese", "English", "Korean", "French", "Spanish"])
+    st.divider()
+    st.markdown("### Profile")
+    belt_level = st.selectbox("Your Belt Level", ["White", "Blue", "Purple", "Brown", "Black"])
+
+    if st.button("Clear Session", use_container_width=True):
+        cleanup_temp_files()
+        if api_key:
+            try:
+                cleanup_gemini_file(genai.Client(api_key=api_key))
+            except Exception:
+                pass
+        st.session_state.clear()
+        st.rerun()
+
+# --- 4. Main Interface ---
 if api_key:
     client = genai.Client(api_key=api_key)
-    # Specify the latest model from the list
-    model_id = "gemini-2.5-pro" 
+    model_id = "gemini-2.0-flash"
 
-    tab1, tab2 = st.tabs(["📂 Upload Video", "🔗 Analyze from YouTube URL"])
+    col_main, col_chat = st.columns([1.3, 0.7], gap="large")
 
-    with tab1:
-        uploaded_file = st.file_uploader("Select Sparring Video", type=["mp4", "mov", "avi"])
-        if uploaded_file:
-            path = "temp_raw.mp4"
-            with open(path, "wb") as f:
-                f.write(uploaded_file.read())
-            st.session_state.video_path = path
+    with col_main:
+        st.markdown("## Technical Analysis")
+        tab1, tab2 = st.tabs(["Upload", "URL"])
+        with tab1:
+            up_file = st.file_uploader("Select Video", type=["mp4", "mov", "avi"], label_visibility="collapsed")
+            if up_file:
+                # Allow re-upload: detect new file by name
+                if up_file.name != st.session_state.uploaded_file_name:
+                    cleanup_temp_files()
+                    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+                    tmp.write(up_file.read())
+                    tmp.close()
+                    st.session_state.video_path = tmp.name
+                    st.session_state.temp_files.append(tmp.name)
+                    st.session_state.uploaded_file_name = up_file.name
+                    st.session_state.analysis_done = False
+                    st.session_state.chat_history = []
+                    st.session_state.uploaded_video_obj = None
+                    st.session_state.gemini_file_name = None
 
-    with tab2:
-        url = st.text_input("Enter YouTube URL")
-        if url and st.button("Get Video"):
-            with st.spinner("Downloading..."):
-                try:
-                    yt_path = "temp_yt.mp4"
-                    ydl_opts = {'format': 'mp4[height<=480]', 'outtmpl': yt_path, 'overwrites': True}
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([url])
-                    st.session_state.video_path = yt_path
-                    st.rerun() 
-                except Exception as e:
-                    st.error(f"YouTube Download Error: {e}")
+        with tab2:
+            video_url = st.text_input("YouTube / Video URL", placeholder="https://www.youtube.com/watch?v=...")
+            if st.button("Download Video"):
+                if video_url:
+                    with st.spinner("Downloading video..."):
+                        downloaded = download_video_from_url(video_url)
+                    if downloaded:
+                        cleanup_temp_files()
+                        st.session_state.video_path = downloaded
+                        st.session_state.temp_files.append(downloaded)
+                        st.session_state.uploaded_file_name = video_url
+                        st.session_state.analysis_done = False
+                        st.session_state.chat_history = []
+                        st.session_state.uploaded_video_obj = None
+                        st.session_state.gemini_file_name = None
+                        st.rerun()
+                else:
+                    st.warning("Please enter a URL.")
 
-    # --- 5. Analysis Section ---
-    if st.session_state.video_path and os.path.exists(st.session_state.video_path):
-        st.video(st.session_state.video_path)
-        
-        if st.button("🚀 Start Latest AI Analysis"):
-            processed_path = "optimized_for_ai.mp4"
-            final_path = compress_video(st.session_state.video_path, processed_path)
-            
-            with st.spinner("Latest AI is analyzing the video..."):
-                try:
-                    # Upload file and wait for status
-                    uploaded_video = client.files.upload(file=final_path)
-                    while uploaded_video.state == "PROCESSING":
-                        time.sleep(2)
-                        uploaded_video = client.files.get(name=uploaded_video.name)
+        if st.session_state.video_path:
+            st.video(st.session_state.video_path)
 
-                    # Build personalized prompt
-                    prompt = f"""
-                    You are a world-class Brazilian Jiu-Jitsu coach.
-                    Analyze the provided video with high precision, considering the following user information.
-                    
-                    【User Profile】
-                    - Level: {belt_level}
-                    - Favorite Style: {favorite_moves}
-                    - Specific Focus/Concern: {specific_concern}
+            # Identity入力欄 (視認性改善済み)
+            st.session_state.user_identity = st.text_input(
+                "Identify yourself (Focus of coaching):",
+                value=st.session_state.user_identity,
+                placeholder="e.g., The one in the White Gi"
+            )
 
-                    【Output Format】
-                    You must output a valid JSON object with the following structure:
-                    {{
-                        "captions": [
-                            {{
-                                "timestamp": "MM:SS",
-                                "text": "Short, punchy critique or advice (max 15 words) to be displayed on video."
-                            }}
-                        ],
-                        "detailed_report": "Full markdown report containing 1. Positional Diagnosis, 2. Detailed Technical Corrections, 3. Connecting to Favorite Moves, 4. Counters and Next Steps, 5. Drills for Improvement."
-                    }}
-                    
-                    Ensure the "captions" are sorted by timestamp.
-                    """
-                    
-                    response = client.models.generate_content(
-                        model=model_id,
-                        contents=[prompt, uploaded_video],
-                        config={'response_mime_type':'application/json'}
-                    )
-                    
-                    # Parse JSON response
-                    try:
-                        import json
-                        analysis_data = json.loads(response.text)
-                        captions = analysis_data.get("captions", [])
-                        detailed_report = analysis_data.get("detailed_report", "No report generated.")
-                    except json.JSONDecodeError:
-                        st.error("Failed to parse AI response as JSON.")
-                        st.text(response.text)
-                        st.stop()
+            if not st.session_state.analysis_done:
+                if st.button("Run Technical Evaluation", type="primary", use_container_width=True):
+                    if st.session_state.user_identity:
+                        with st.status("Evaluating biomechanics...", expanded=True):
+                            try:
+                                tmp_compressed = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+                                tmp_compressed.close()
+                                st.session_state.temp_files.append(tmp_compressed.name)
+                                final_v = compress_video(st.session_state.video_path, tmp_compressed.name)
+                                uploaded_v = client.files.upload(file=final_v)
 
-                    st.divider()
-                    st.subheader("📝 Personalized Expert Report")
-                    st.markdown(detailed_report)
-                    
-                    # Generate Caption Video
-                    if captions:
-                        with st.status("🎬 Generating Captioned Video...", expanded=True) as status:
-                            srt_path = "subtitles.srt"
-                            captioned_video_path = "captioned_output.mp4"
-                            
-                            st.write("Generating subtitles...")
-                            generate_srt(captions, srt_path)
-                            
-                            st.write("Burning subtitles into video...")
-                            result_path = burn_subtitles(final_path, srt_path, captioned_video_path)
-                            
-                            if result_path and os.path.exists(result_path):
-                                st.success("Video generated!")
-                                st.video(result_path)
-                                st.session_state.captioned_video_path = result_path
-                            else:
-                                st.error("Failed to generate captioned video.")
-                            status.update(label="Analysis Complete!", state="complete", expanded=False)
+                                # Poll with timeout
+                                start_time = time.time()
+                                while uploaded_v.state == "PROCESSING":
+                                    if time.time() - start_time > MAX_POLL_SECONDS:
+                                        st.error("Video processing timed out. Please try again.")
+                                        st.stop()
+                                    time.sleep(2)
+                                    uploaded_v = client.files.get(name=uploaded_v.name)
 
-                    # Delete file on server
-                    client.files.delete(name=uploaded_video.name)
-                    
-                except Exception as e:
-                    st.error(f"Analysis Error: {e}")
-                    import traceback
-                    st.text(traceback.format_exc())
+                                st.session_state.uploaded_video_obj = uploaded_v
+                                st.session_state.gemini_file_name = uploaded_v.name
+
+                                safe_identity = sanitize_user_input(st.session_state.user_identity)
+                                # プロンプトの純粋技術化
+                                prompt = f"""
+                                You are a high-level Brazilian Jiu-Jitsu technical analyst.
+                                TARGET: Provide advice ONLY for the person identified as: [{safe_identity}].
+                                Language: {language}. Belt: {belt_level}.
+
+                                ANALYSIS CORE:
+                                - [MM:SS] format for every key point.
+                                - GOOD: Identify mechanical advantage (Base, Leverage, Framing). Suggest the next logical transition.
+                                - BAD: Explain structural failure. Recommend specific techniques/moves to fix or escape.
+                                - TECHNIQUE NAMES: Use standard BJJ terminology (e.g., De La Riva, X-Guard, Underhook, Hip Escape).
+
+                                Be direct, analytical, and focus on maximizing physical efficiency.
+                                """
+                                response = client.models.generate_content(model=model_id, contents=[prompt, uploaded_v])
+                                st.session_state.chat_history.append({"role": "assistant", "content": response.text})
+                                st.session_state.analysis_done = True
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Analysis failed: {e}")
+                    else:
+                        st.warning("Please identify which player you are.")
+
+    with col_chat:
+        st.markdown('### Technical Feedback')
+        with st.container(border=True):
+            chat_box = st.container(height=650, border=False)
+            with chat_box:
+                if not st.session_state.chat_history: st.write("Awaiting analysis...")
+                for msg in st.session_state.chat_history:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+
+            if not st.session_state.analysis_done:
+                st.warning("Run an analysis first to enable the chat.")
+            elif not st.session_state.user_identity:
+                st.warning("Please identify yourself before chatting.")
+            else:
+                st.caption(f"Chat uses the last {CHAT_CONTEXT_WINDOW} messages for context.")
+                if user_input := st.chat_input("Ask about details..."):
+                    if st.session_state.uploaded_video_obj:
+                        st.session_state.chat_history.append({"role": "user", "content": user_input})
+                        # Cap chat history
+                        if len(st.session_state.chat_history) > MAX_CHAT_HISTORY:
+                            st.session_state.chat_history = st.session_state.chat_history[-MAX_CHAT_HISTORY:]
+
+                        safe_identity = sanitize_user_input(st.session_state.user_identity)
+                        contents = [st.session_state.uploaded_video_obj]
+                        contents.append(f"Focus advice on [{safe_identity}]. Be technically precise.\n---\nConversation history:")
+                        for m in st.session_state.chat_history[-CHAT_CONTEXT_WINDOW:]:
+                            contents.append(f"{m['role']}: {m['content']}")
+                        try:
+                            with st.spinner("Thinking..."):
+                                res = client.models.generate_content(model=model_id, contents=contents)
+                            st.session_state.chat_history.append({"role": "assistant", "content": res.text})
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Chat response failed: {e}")
 else:
-    st.info("Please enter your Gemini API Key in the sidebar.")
+    st.info("Please enter your API Key in the sidebar.")
